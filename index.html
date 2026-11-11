@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BakudanSlim ― 爆弾スライム</title>
+<style>
+  @font-face { font-family:"HP Denki"; src:url("assets/denki-chip/x8y12pxDenkiChip.woff2") format("woff2"); }
+  body { margin:0; background:#0d1526; color:#dfe8ff; font-family: system-ui, sans-serif; text-align:center; }
+  h1 { font-family:"HP Denki", sans-serif; font-size:24px; }
+  .wrap { max-width: 680px; margin: 0 auto; padding: 16px 12px 32px; }
+  h1 { font-size: 18px; margin: 6px 0 2px; }
+  .sub { color:#8fa5cc; font-size: 12.5px; margin-bottom: 10px; }
+  canvas { width: 100%; max-width: 640px; background:#0a1120; border:1px solid #26355a; border-radius:10px; image-rendering: pixelated; }
+  .keys { color:#8fa5cc; font-size: 12.5px; line-height: 1.8; margin-top: 10px; text-align:left; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>BakudanSlim</h1>
+  <div class="sub">爆弾を置いて、爆風で飛ぶパズル。移動はピクセル単位、爆発の解決はセル（配列）単位。自機は設定データから生成するスライム。</div>
+  <canvas id="cv" width="640" height="480"></canvas>
+  <div class="keys">
+    移動: ←→（A/D）／ 爆弾を横に置く: Z または Space ／ 足元に置く・積む: ↓ ／ 起爆（置いた順）: X または ↑ ／ タイトルへ: Esc ／ やり直し: R<br>
+    爆弾の上に乗って起爆すると真上に、横で起爆すると横に飛びます。爆風に当たった爆弾は連鎖して爆発し、連鎖するほど爆風が広がります。
+  </div>
+  <label for="hero" style="display:block;text-align:left;font-size:13px;color:#8fa5cc;margin-top:16px;">主役定義（Markdown）― スライムメーカーのURLを貼ると、タイトルとゲームの主役がそのスライムになります</label>
+  <textarea id="hero" spellcheck="false" style="width:100%;box-sizing:border-box;height:118px;background:#0a1120;color:#b9fbc0;border:1px solid #26355a;border-radius:8px;padding:10px;font-family:ui-monospace,monospace;font-size:12.5px;"># 主役
+- 名前: OooMakerのスライム
+- 形: まる
+- 色: #00e436
+- スライムメーカーのURL:</textarea>
+  <div id="heroErr" style="color:#ff9d9d;font-size:12.5px;min-height:1em;text-align:left;"></div>
+  <div style="text-align:left;"><button id="applyHero" style="background:#1d2c4f;color:#dfe8ff;border:1px solid #3a5080;border-radius:999px;padding:7px 14px;font-size:13px;cursor:pointer;">主役を反映する</button></div>
+  <label for="rules" style="display:block;text-align:left;font-size:13px;color:#8fa5cc;margin-top:16px;">ルール定義（Markdown）― 書き換えて「反映」を押すと、ゲームのルールが変わります</label>
+  <textarea id="rules" spellcheck="false" style="width:100%;box-sizing:border-box;height:150px;background:#0a1120;color:#b9fbc0;border:1px solid #26355a;border-radius:8px;padding:10px;font-family:ui-monospace,monospace;font-size:12.5px;"># bakudanslim ルール
+- 爆風の届くセル数: 4
+- 連鎖で増えるセル数: 2
+- 爆風に当たった爆弾: 爆発する
+- 爆弾が戻るまでのステップ: 45
+- 持てる爆弾の数: 2
+- 上に飛ぶ高さ（セル数）: 4
+- 子分との距離: 24</textarea>
+  <div id="ruleErr" style="color:#ff9d9d;font-size:12.5px;min-height:1em;text-align:left;"></div>
+  <div style="text-align:left;"><button id="applyRules" style="background:#1d2c4f;color:#dfe8ff;border:1px solid #3a5080;border-radius:999px;padding:7px 14px;font-size:13px;cursor:pointer;">ルールを反映する</button></div>
+</div>
+<script>
+"use strict";
+// ============ 基本定数（Pyxel版 bakudanslim.py を仕様として移植） ============
+const TILE = 16, COLS = 40, ROWS = 30;
+const WORLD_W = COLS*TILE, WORLD_H = ROWS*TILE;
+const VIEW_W = 320, VIEW_H = 240;
+const T_EMPTY=0, T_WALL=1, T_SPAWN=2, T_GOAL=3;
+const GRAVITY = 0.8, FRICTION = 0.8, WALK = 4;
+const PALETTE = ["#f0473e","#f78c1f","#ffd23e","#3f9de0","#b96fe0","#4fd24f"];
+
+// ルール（Markdown定義から読み込む。下は初期値）
+let RULES = { blast:4, chainBonus:2, chainMode:"explode", returnSteps:45, maxBombs:2, jumpCells:4, gap:24 };
+const jumpV = ()=> Math.sqrt(2*GRAVITY*(RULES.jumpCells*TILE));
+// 横の初速: 摩擦は移動前に掛かるため、合計の移動量 = 初速 × FRICTION/(1-FRICTION)。
+// 爆風の届くセル数ちょうどまで飛ぶよう、その分を割り戻して初速を決める
+const blastVFor = (range)=> range*TILE*(1-FRICTION)/FRICTION;
+
+function parseRules(md){
+  const r = {...RULES}; let found = 0;
+  const num = (line)=>{ const m = line.match(/([0-9]+)\s*$/); return m ? parseInt(m[1],10) : null; };
+  for (const raw of md.split("\n")){
+    const line = raw.trim();
+    if (!line.startsWith("-")) continue;
+    if (line.includes("爆風の届くセル数")){ const v=num(line); if (v!==null){ r.blast=v; found++; } }
+    else if (line.includes("連鎖で増えるセル数")){ const v=num(line); if (v!==null){ r.chainBonus=v; found++; } }
+    else if (line.includes("爆風に当たった爆弾")){ if (line.includes("爆発")){ r.chainMode="explode"; found++; } else if (line.includes("飛")){ r.chainMode="fly"; found++; } }
+    else if (line.includes("戻るまでのステップ")){ const v=num(line); if (v!==null){ r.returnSteps=v; found++; } }
+    else if (line.includes("持てる爆弾の数")){ const v=num(line); if (v!==null){ r.maxBombs=v; found++; } }
+    else if (line.includes("上に飛ぶ高さ")){ const v=num(line); if (v!==null){ r.jumpCells=v; found++; } }
+    else if (line.includes("子分との距離")){ const v=num(line); if (v!==null){ r.gap=v; found++; } }
+  }
+  return found ? r : null;
+}
+
+// 主役は定義（Markdown）から決まる。既定は OooMaker のスライム（Pyxel版: 緑の丸＋黒い縁＋点の目）
+let HERO = { name:"OooMakerのスライム", shape:"round", color:"#00e436", belly:"#b9fbc0", scale:1.0, wide:1.15, eye:"normal", mouth:"smile", pattern:"none", seed:7, hop:1.0 };
+
+function decodePayload(s){
+  const b64 = s.replace(/-/g,"+").replace(/_/g,"/");
+  return JSON.parse(decodeURIComponent(escape(atob(b64))));
+}
+function parseHero(md){
+  const h = { name:"OooMakerのスライム", shape:"round", color:"#00e436", belly:"#b9fbc0", scale:1.0, wide:1.15, eye:"normal", mouth:"smile", pattern:"none", seed:7, hop:1.0 };
+  let url = "";
+  for (const raw of md.split("\n")){
+    const line = raw.trim();
+    if (!line.startsWith("-")) continue;
+    const val = line.slice(line.indexOf(":")+1).trim();
+    if (line.includes("スライムメーカーのURL")) url = val;
+    else if (line.includes("名前")) h.name = val || h.name;
+    else if (line.includes("形")) h.shape = val.includes("ドーム") ? "dome" : "round";
+    else if (line.includes("色")){ const m = val.match(/#[0-9a-fA-F]{6}/); if (m) h.color = m[0]; }
+  }
+  if (url){
+    const m = url.match(/[?&]s=([A-Za-z0-9\-_]+)/);
+    if (!m) return null;
+    try {
+      const s = decodePayload(m[1]);
+      return { ...h, ...s, shape:"dome", name: s.name || "メーカーのスライム" };
+    } catch(e){ return null; }
+  }
+  return h;
+}
+// 丸い主役（OooMaker風）。cx, cy は中心、r は半径、t はステップ数
+function drawRoundHero(c, cx, cy, r, t){
+  c.fillStyle = "#101418";
+  c.beginPath(); c.arc(cx, cy, r, 0, Math.PI*2); c.fill();
+  c.fillStyle = HERO.color;
+  c.beginPath(); c.arc(cx, cy, r*0.8, 0, Math.PI*2); c.fill();
+  const blink = (t % 100) < 5;
+  const lo = Math.sin(t*0.05) > 0.3 ? r*0.12 : (Math.sin(t*0.021) > 0.4 ? -r*0.12 : 0);
+  c.fillStyle = "#101418";
+  for (const side of [-1,1]){
+    const ex = cx + side*r*0.34 + lo, ey = cy - r*0.08;
+    if (blink){ c.fillRect(ex - r*0.13, ey, r*0.26, Math.max(1, r*0.07)); }
+    else { c.beginPath(); c.arc(ex, ey, r*0.11, 0, Math.PI*2); c.fill(); }
+  }
+}
+
+// ============ 入力 ============
+const keys = {}, pressed = {};
+addEventListener("keydown", e=>{
+  if (["ArrowLeft","ArrowRight","ArrowUp","ArrowDown","Space"].includes(e.code)) e.preventDefault();
+  if (!keys[e.code]) pressed[e.code] = true;
+  keys[e.code] = true;
+});
+addEventListener("keyup", e=>{ keys[e.code] = false; });
+const btn  = (...cs)=> cs.some(c=>keys[c]);
+const btnp = (...cs)=> cs.some(c=>pressed[c]);
+
+// ============ ワールド（配列） ============
+let grid = [];
+function cellAt(cx, cy){ if (cx<0||cy<0||cx>=COLS||cy>=ROWS) return T_WALL; return grid[cy][cx]; }
+function genLevel(){
+  grid = Array.from({length:ROWS}, ()=>Array(COLS).fill(T_EMPTY));
+  for (let x=0;x<COLS;x++){ grid[0][x]=T_WALL; grid[ROWS-1][x]=T_WALL; }
+  for (let y=0;y<ROWS;y++){ grid[y][0]=T_WALL; grid[y][COLS-1]=T_WALL; }
+  for (let i=0;i<30;i++){
+    const gx = 2+Math.floor(Math.random()*36), gy = 8+Math.floor(Math.random()*18);
+    const len = 2+Math.floor(Math.random()*5);
+    for (let px=0; px<len && gx+px<COLS-1; px++) grid[gy][gx+px]=T_WALL;
+  }
+  grid[27][2]=T_SPAWN; grid[27][37]=T_GOAL;
+}
+genLevel();
+
+// ============ エンティティ共通の物理（ピクセル単位） ============
+function tileSolidAtPx(px, py){ return cellAt(Math.floor(px/TILE), Math.floor(py/TILE))===T_WALL; }
+function moveAxisX(e, solids, dx){
+  if (dx === 0) return;
+  e.x += dx;
+  e.x = Math.max(0, Math.min(e.x, WORLD_W-e.w));
+  const top = Math.floor(e.y/TILE), bot = Math.floor((e.y+e.h-1)/TILE);
+  if (dx > 0){ const tx = Math.floor((e.x+e.w)/TILE);
+    for (let ty=top; ty<=bot; ty++) if (cellAt(tx,ty)===T_WALL){ e.x = tx*TILE-e.w-0.01; e.vx=0; break; } }
+  if (dx < 0){ const tx = Math.floor(e.x/TILE);
+    for (let ty=top; ty<=bot; ty++) if (cellAt(tx,ty)===T_WALL){ e.x = (tx+1)*TILE+0.01; e.vx=0; break; } }
+  for (const o of solids){ if (o===e) continue;
+    if (Math.abs(e.y-o.y) < e.h-2){
+      if (e.x < o.x && e.x+e.w > o.x){ if (e.onHitX) e.onHitX(o, 1); else { e.x = o.x-e.w; e.vx=0; } }
+      else if (e.x > o.x && e.x < o.x+o.w){ if (e.onHitX) e.onHitX(o, -1); else { e.x = o.x+o.w; e.vx=0; } }
+    }
+  }
+}
+function moveAxisY(e, solids, dy){
+  e.y += dy;
+  e.y = Math.max(0, Math.min(e.y, WORLD_H-e.h));
+  const left = Math.floor(e.x/TILE), right = Math.floor((e.x+e.w-1)/TILE);
+  if (e.vy >= 0){ const ty = Math.floor((e.y+e.h)/TILE);
+    for (let tx=left; tx<=right; tx++) if (cellAt(tx,ty)===T_WALL){ e.y = ty*TILE-e.h-0.01; e.vy=0; break; } }
+  if (e.vy < 0){ const ty = Math.floor(e.y/TILE);
+    for (let tx=left; tx<=right; tx++) if (cellAt(tx,ty)===T_WALL){ e.y = (ty+1)*TILE+0.01; e.vy=0; break; } }
+  for (const o of solids){ if (o===e) continue;
+    if (Math.abs(e.x-o.x) < e.w-2){
+      if (e.vy >= 0 && e.y < o.y && e.y+e.h >= o.y){ e.y = o.y-e.h-0.01; e.vy=0; if (e.onLandOn) e.onLandOn(o); }
+      else if (e.vy < 0 && e.y > o.y && e.y <= o.y+o.h){ e.y = o.y+o.h+0.01; e.vy=0; }
+    }
+  }
+}
+// 速い移動で壁をすり抜けないよう、1ステップの移動を8px以下の小刻みに分ける
+function moveCollide(e, solids){
+  const steps = Math.max(1, Math.ceil(Math.max(Math.abs(e.vx), Math.abs(e.vy))/8));
+  const sx = e.vx/steps, sy = e.vy/steps;
+  for (let k=0;k<steps;k++){
+    moveAxisX(e, solids, e.vx===0 ? 0 : sx);
+    moveAxisY(e, solids, (e.vy===0 && k>0) ? 0 : sy);
+    if (e.vx===0 && e.vy===0) break;
+  }
+}
+function isGrounded(e, solids){
+  const by = e.y + e.h + 2;
+  const l = Math.floor(e.x/TILE), r = Math.floor((e.x+e.w-1)/TILE), ty = Math.floor(by/TILE);
+  for (let tx=l; tx<=r; tx++) if (cellAt(tx,ty)===T_WALL && Math.abs(e.y - (ty*TILE - e.h)) < 2.5) return true;
+  for (const o of solids){ if (o!==e && Math.abs(e.x-o.x) < e.w-2 && Math.abs(e.y - (o.y - e.h)) < 2.5) return true; }
+  return false;
+}
+
+// ============ 爆弾 ============
+class Bomb {
+  constructor(x, y, col){ this.x=x; this.y=y; this.w=14; this.h=14; this.col=col; this.vx=0; this.vy=0; this.state="NORMAL"; this.spawnAnim=0; }
+  update(solids, player){
+    this.spawnAnim = Math.min(this.spawnAnim+1, 5);
+    if (this.state==="BLASTED"){ this.vx*=FRICTION; if (Math.abs(this.vx)<0.1) this.vx=0; this.vy+=GRAVITY; }
+    else if (this.state==="FALLING"){ this.vy+=GRAVITY; }
+    else { this.vx=0; this.vy=0; }
+    this.onHitX = (o, dir)=>{
+      if (o===player){
+        // 飛んでいる爆弾がプレイヤーを押す（Pyxel版の規則）
+        player.x = dir>0 ? this.x+this.w : this.x-player.w;
+        if (Math.abs(this.vx)>1){ player.vx=this.vx; this.vx*=0.5; player.state="BLASTED"; }
+        this.x = dir>0 ? player.x-this.w : player.x+player.w;
+      } else { this.x = dir>0 ? o.x-this.w : o.x+o.w; this.vx=0; }
+    };
+    moveCollide(this, solids);
+    if (isGrounded(this, solids) && this.vy>=0){
+      this.vy=0;
+      if (this.state==="BLASTED" && Math.abs(this.vx)<1){ this.state="NORMAL"; this.vx=0; }
+      else if (this.state!=="BLASTED") this.state="NORMAL";
+    } else if (this.state==="NORMAL") this.state="FALLING";
+  }
+  draw(ctx, player){
+    const cx=this.x+7, cy=this.y+7;
+    const r = Math.max(2, Math.min(6, 6*(this.spawnAnim/5)));
+    ctx.beginPath(); ctx.arc(cx, cy, r+1.5, 0, Math.PI*2); ctx.strokeStyle="#0a0f1c"; ctx.lineWidth=2; ctx.stroke();
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2); ctx.fillStyle=this.col; ctx.fill();
+    if (r>=4){
+      const dx=player.x-this.x, dy=player.y-this.y, d=Math.hypot(dx,dy)||1;
+      ctx.fillStyle="#0a0f1c";
+      ctx.fillRect(cx-3+dx/d*1.5-0.5, cy-1+dy/d*1.5-0.5, 2, 2);
+      ctx.fillRect(cx+2+dx/d*1.5-0.5, cy-1+dy/d*1.5-0.5, 2, 2);
+    }
+  }
+}
+
+// ============ プレイヤー ============
+class Player {
+  constructor(x, y){
+    this.x=x; this.y=y; this.w=14; this.h=14; this.vx=0; this.vy=0;
+    this.facingRight=true; this.state="NORMAL";
+    this.bombs=RULES.maxBombs;
+    this.heldColors=Array.from({length:RULES.maxBombs}, (_,i)=>PALETTE[i%PALETTE.length]);
+    this.rq=[];
+    this.history=Array.from({length:100}, ()=>[x,y]);
+    this.trail=[];   // 子分（引き連れた爆弾）の位置
+  }
+  update(solids){
+    const L = btn("ArrowLeft","KeyA"), R = btn("ArrowRight","KeyD");
+    if (this.state==="NORMAL"){
+      this.vx=0; this.vy=0;
+      if (L){ this.vx=-WALK; this.facingRight=false; } else if (R){ this.vx=WALK; this.facingRight=true; }
+    } else {
+      if (L){ this.vx=Math.max(this.vx-1, -WALK); this.facingRight=false; }
+      else if (R){ this.vx=Math.min(this.vx+1, WALK); this.facingRight=true; }
+      else this.vx*=FRICTION;
+      this.vy=Math.min(this.vy+GRAVITY, 14);
+    }
+    this.onHitX=null; this.onLandOn=(o)=>{ if (Math.abs(o.vx)>1){ this.vx=o.vx; this.state="BLASTED"; } };
+    moveCollide(this, solids);
+    if (isGrounded(this, solids) && this.vy>=0){
+      this.vy=0;
+      if (this.state==="BLASTED"){ if (Math.abs(this.vx)<1){ this.state="NORMAL"; this.vx=0; } }
+      else this.state="NORMAL";
+    } else if (this.state==="NORMAL") this.state="FALLING";
+    this.history.unshift([this.x, this.y]); this.history.length=100;
+    // 子分: ロープでつながれたように追う（距離が開いた分だけ寄る。止まっても回り込まない）
+    while (this.trail.length < this.bombs){
+      const tp = this.trail.length===0 ? this : this.trail[this.trail.length-1];
+      this.trail.push({x: tp.x + (this.facingRight?-1:1)*RULES.gap, y: tp.y});
+    }
+    this.trail.length = this.bombs;
+    for (let i=0;i<this.trail.length;i++){
+      const tp = i===0 ? this : this.trail[i-1], f = this.trail[i];
+      const dx=f.x-tp.x, dy=f.y-tp.y, d=Math.hypot(dx,dy);
+      if (d > RULES.gap){ f.x = tp.x + dx/d*RULES.gap; f.y = tp.y + dy/d*RULES.gap; }
+    }
+    const nrq=[];
+    for (const [t,c] of this.rq){ if (t>0) nrq.push([t-1,c]); else { this.bombs++; this.heldColors.push(c); } }
+    this.rq=nrq;
+  }
+}
+// ============ スライム描画（キャラ生成エンジン: 設定 → 絵） ============
+function drawSlime(ctx, cx, baseY, R, s, t, facing, state){
+  let squash = 1 + Math.sin(t*2.2 + s.seed)*0.03;
+  if (state==="BLASTED" || state==="FALLING") squash = 1.12;       // 飛んでいる間は少し伸びる
+  const bodyW = R * s.wide * (1 + (1-squash)*0.9), bodyH = R * squash * 1.18;
+  ctx.save(); ctx.translate(cx, baseY);
+  const path = new Path2D();
+  path.moveTo(-bodyW, 0);
+  path.bezierCurveTo(-bodyW, -bodyH*1.05, -bodyW*0.45, -bodyH*1.28, 0, -bodyH*1.28);
+  path.bezierCurveTo(bodyW*0.45, -bodyH*1.28, bodyW, -bodyH*1.05, bodyW, 0);
+  path.closePath();
+  ctx.fillStyle = s.color; ctx.fill(path);
+  ctx.save(); ctx.clip(path);
+  ctx.fillStyle = s.belly;
+  ctx.beginPath(); ctx.ellipse(0, -bodyH*0.18, bodyW*0.62, bodyH*0.42, 0, 0, Math.PI*2); ctx.fill();
+  ctx.fillStyle = "rgba(255,255,255,0.5)";
+  ctx.beginPath(); ctx.ellipse(-bodyW*0.38, -bodyH*0.92, bodyW*0.16, bodyH*0.10, -0.5, 0, Math.PI*2); ctx.fill();
+  ctx.restore();
+  const blink = ((t + s.seed*0.7) % 3.1) > 2.95 ? 0.1 : 1;
+  const eyeY = -bodyH*0.72, eyeDX = bodyW*0.34, eyeR = Math.max(1.2, R*0.13);
+  ctx.fillStyle = "#14202e";
+  for (const side of [-1,1]){
+    const ex = side*eyeDX + (facing?1:-1)*eyeR*0.6;
+    ctx.beginPath(); ctx.ellipse(ex, eyeY, eyeR*0.8, eyeR*blink, 0, 0, Math.PI*2); ctx.fill();
+  }
+  ctx.strokeStyle="#14202e"; ctx.lineWidth=Math.max(1, R*0.06); ctx.lineCap="round";
+  ctx.beginPath(); ctx.arc(0, -bodyH*0.52, R*0.18, Math.PI*0.15, Math.PI*0.85); ctx.stroke();
+  ctx.restore();
+}
+
+// ============ ゲーム本体 ============
+const cv = document.getElementById("cv"), ctx = cv.getContext("2d");
+let state = "title";           // title | play | clear
+let player = null, bombs = [], particles = [], blastFx = [];
+let camX = 0, camY = 0, shake = 0, menuIdx = 0, stepCount = 0, clearTimer = 0;
+
+function startLevel(edit){
+  let sx=32, sy=32;
+  for (let y=0;y<ROWS;y++) for (let x=0;x<COLS;x++) if (grid[y][x]===T_SPAWN){
+    sx=x*TILE+1; sy=y*TILE;
+    for (let gy=y; gy<ROWS; gy++) if (grid[gy][x]===T_WALL){ sy=gy*TILE-14; break; }
+  }
+  player = new Player(sx, sy); bombs=[]; particles=[]; blastFx=[];
+  camX = Math.max(0, Math.min(player.x-VIEW_W/2, WORLD_W-VIEW_W));
+  camY = Math.max(0, Math.min(player.y-VIEW_H/2, WORLD_H-VIEW_H));
+  state = "play";
+}
+
+// ---- 爆発の解決（配列＝セル単位で決め打ち） ----
+function blastCells(b, range){
+  const bcx = Math.floor((b.x+b.w/2)/TILE), bcy = Math.floor((b.y+b.h/2)/TILE);
+  const cells = new Set([bcx+","+bcy]);
+  for (const [dx,dy] of [[1,0],[-1,0],[0,1],[0,-1]]){
+    for (let i=1;i<=range;i++){
+      const cx=bcx+dx*i, cy=bcy+dy*i;
+      if (cx<0||cy<0||cx>=COLS||cy>=ROWS) break;
+      if (grid[cy][cx]===T_WALL) break;
+      cells.add(cx+","+cy);
+    }
+  }
+  return cells;
+}
+function explodeBomb(b, depth){
+  const idx = bombs.indexOf(b); if (idx<0) return;
+  bombs.splice(idx,1);
+  player.rq.push([RULES.returnSteps, b.col]);
+  shake = Math.min(9, 5+depth*2);
+  const range = RULES.blast + RULES.chainBonus*depth;   // 連鎖するほど爆風が広がる
+  const cells = blastCells(b, range);
+  blastFx.push({cells, t:10});
+  const launched = new Set();
+  const launch = (e)=>{
+    const dx = (e.x+e.w/2)-(b.x+b.w/2), dy = (e.y+e.h/2)-(b.y+b.h/2);
+    if (dy < -7){ e.vy = -jumpV(); e.vx = Math.abs(dx)>6 ? Math.sign(dx)*6 : 0; }
+    else if (dy > 7){ e.vy = 4; }
+    else { e.vx = Math.sign(dx||1)*blastVFor(range); e.vy = -4.5; }
+    e.state = "BLASTED"; launched.add(e);
+  };
+  const cellOf = e => Math.floor((e.x+e.w/2)/TILE)+","+Math.floor((e.y+e.h/2)/TILE);
+  const chained = [];
+  if (cells.has(cellOf(player))) launch(player);
+  for (const e of [...bombs]){
+    if (!cells.has(cellOf(e))) continue;
+    if (RULES.chainMode==="explode") chained.push(e); else launch(e);
+  }
+  // 飛ばされたものの上に乗っているものも同じ速度で飛ぶ
+  for (const e of [player, ...bombs]){
+    if (launched.has(e) || chained.includes(e)) continue;
+    for (const base of launched){
+      if (Math.abs(e.x-base.x) < e.w-2 && Math.abs(e.y-(base.y-e.h)) < 3){ e.vx=base.vx; e.vy=base.vy; e.state="BLASTED"; launched.add(e); break; }
+    }
+  }
+  for (let i=0;i<15;i++){
+    const a=Math.random()*Math.PI*2, sp=1.5+Math.random()*3;
+    particles.push({x:b.x+7, y:b.y+7, vx:Math.cos(a)*sp, vy:Math.sin(a)*sp, life:15+Math.random()*15, col:["#f7f7f7","#f0473e","#f78c1f","#ffd23e"][i%4]});
+  }
+  for (const cb of chained) explodeBomb(cb, depth+1);   // 連鎖爆発
+}
+function detonate(){
+  const b = bombs[bombs.length-1]; if (!b) return;
+  explodeBomb(b, 0);
+}
+
+function placeSide(){
+  const c = player.heldColors.shift();
+  const bx = player.x + (player.facingRight ? player.w : -player.w), by = player.y;
+  if (cellAt(Math.floor((bx+7)/TILE), Math.floor((by+7)/TILE))!==T_WALL){ bombs.unshift(new Bomb(bx, by, c)); player.bombs--; shake=2; }
+  else player.heldColors.unshift(c);
+}
+function placeStack(){
+  const c = player.heldColors.shift();
+  // 足元の積み重なりを下へたどる（Pyxel版の規則: 新しい爆弾は一番下に入り、全部が1個分ずつ持ち上がる）
+  const stack=[]; let cx=player.x, cy=player.y;
+  while (true){
+    const f = bombs.find(o=>Math.abs(o.x-cx)<12 && Math.abs(o.y-(cy+14))<3);
+    if (!f) break; stack.push(f); cx=f.x; cy=f.y;
+  }
+  for (const o of stack) o.y -= 14;
+  player.y -= 14;
+  bombs.unshift(new Bomb(cx, cy, c)); player.bombs--; shake=2;
+}
+
+function step(){
+  stepCount++;
+  if (shake>0) shake=Math.max(0, shake-0.5);
+  if (state==="title"){
+    if (btnp("ArrowUp","KeyW")) menuIdx=(menuIdx+1)%2;
+    if (btnp("ArrowDown","KeyS")) menuIdx=(menuIdx+1)%2;
+    if (btnp("Enter","Space","KeyZ")){ if (menuIdx===0){ genLevel(); startLevel(); } else startLevel(); }
+    if (btnp("Digit1")){ genLevel(); startLevel(); }
+    if (btnp("Digit2")) startLevel();
+    return;
+  }
+  if (state==="clear"){ if (--clearTimer<=0) state="title"; return; }
+  // play
+  if (btnp("Escape")){ state="title"; return; }
+  if (btnp("KeyR")){ startLevel(); return; }
+  if (player){
+    if (btnp("Space","KeyZ") && player.bombs>0) placeSide();
+    else if (btn("ArrowDown","KeyS") && btnp("ArrowDown","KeyS") && player.bombs>0){
+      if (btn("ArrowLeft","ArrowRight","KeyA","KeyD")) placeSide(); else placeStack();
+    }
+    if (btnp("ArrowUp","KeyX","KeyW") && bombs.length) detonate();
+    player.update(bombs);
+    for (const b of bombs) b.update([...bombs, player], player);
+    const pcx=Math.floor((player.x+7)/TILE), pcy=Math.floor((player.y+7)/TILE);
+    if (grid[pcy] && grid[pcy][pcx]===T_GOAL){ state="clear"; clearTimer=90; }
+    const tx=Math.max(0, Math.min(player.x-VIEW_W/2+7, WORLD_W-VIEW_W));
+    const ty=Math.max(0, Math.min(player.y-VIEW_H/2+7, WORLD_H-VIEW_H));
+    camX += (tx-camX)*0.1; camY += (ty-camY)*0.1;
+  }
+  particles = particles.filter(p=>{ p.x+=p.vx; p.y+=p.vy; p.vy+=0.2; return --p.life>0; });
+  blastFx = blastFx.filter(f=>--f.t>0);
+}
+
+// ============ 描画 ============
+function draw(){
+  ctx.setTransform(2,0,0,2,0,0);
+  ctx.fillStyle="#0a1120"; ctx.fillRect(0,0,VIEW_W,VIEW_H);
+  const t = stepCount/30;
+  if (state==="title"){
+    ctx.save(); ctx.translate(70, 130);
+    if (HERO.shape==="round") drawRoundHero(ctx, 0, -28, 30, stepCount);
+    else drawSlime(ctx, 0, 0, 26, HERO, t, true, "NORMAL");
+    ctx.restore();
+    ctx.beginPath(); ctx.arc(112, 122, 7, 0, Math.PI*2); ctx.fillStyle="#f0473e"; ctx.fill();
+    ctx.beginPath(); ctx.arc(128, 122, 7, 0, Math.PI*2); ctx.fillStyle="#f78c1f"; ctx.fill();
+    ctx.fillStyle="#dfe8ff"; ctx.font="24px 'HP Denki', sans-serif"; ctx.fillText("BakudanSlim", 140, 130);
+    ctx.font="12px 'HP Denki', sans-serif";
+    const items=["1: Auto Generate Level","2: Play Current Level"];
+    items.forEach((s,i)=>{
+      ctx.fillStyle = menuIdx===i ? "#ffd23e" : "#8fa5cc";
+      ctx.fillText((menuIdx===i?"> ":"  ")+s, 62, 168+i*18);
+    });
+    ctx.fillStyle="#5a6f96"; ctx.font="12px 'HP Denki', sans-serif"; ctx.fillText("JS v0.2", 258, 234);
+    ctx.setTransform(1,0,0,1,0,0);
+    return;
+  }
+  const sx=(Math.random()*2-1)*shake, sy=(Math.random()*2-1)*shake;
+  ctx.save(); ctx.translate(-Math.round(camX)+sx, -Math.round(camY)+sy);
+  ctx.strokeStyle="rgba(60,90,150,0.18)"; ctx.lineWidth=1; ctx.beginPath();
+  for (let x=0;x<=WORLD_W;x+=32){ ctx.moveTo(x,0); ctx.lineTo(x,WORLD_H); }
+  for (let y=0;y<=WORLD_H;y+=32){ ctx.moveTo(0,y); ctx.lineTo(WORLD_W,y); }
+  ctx.stroke();
+  for (let y=0;y<ROWS;y++) for (let x=0;x<COLS;x++){
+    const v=grid[y][x], px=x*TILE, py=y*TILE;
+    if (v===T_WALL){ ctx.fillStyle="#2a3f66"; ctx.fillRect(px,py,TILE,TILE); ctx.fillStyle="#3d5a8f"; ctx.fillRect(px,py,TILE,3); }
+    else if (v===T_SPAWN){ ctx.fillStyle="#1d5c2e"; ctx.fillRect(px,py,TILE,TILE); ctx.fillStyle="#7dff9a"; ctx.font="10px system-ui"; ctx.fillText("S", px+4, py+12); }
+    else if (v===T_GOAL){ ctx.fillStyle="#8f6d1d"; ctx.fillRect(px,py,TILE,TILE); ctx.fillStyle="#ffd23e"; ctx.font="10px system-ui"; ctx.fillText("G", px+4, py+12); }
+  }
+  for (const f of blastFx){
+    ctx.fillStyle=`rgba(255,140,40,${0.35*(f.t/10)})`;
+    for (const key of f.cells){ const [cx,cy]=key.split(",").map(Number); ctx.fillRect(cx*TILE, cy*TILE, TILE, TILE); }
+  }
+  for (const p of particles){ ctx.fillStyle=p.col; ctx.fillRect(p.x-1.5, p.y-1.5, 3, 3); }
+  for (const b of bombs) b.draw(ctx, player);
+  if (player){
+    // 子分（引き連れた爆弾）: 親分にロープでつながれて追う。地面にめり込まない高さで描く
+    for (let i=0;i<player.bombs;i++){
+      const f = player.trail[i] || player;
+      const pw = Math.sin(stepCount*0.2+i*1.8)*1.0;
+      const cx = f.x+7, cy = f.y+5.5+pw;
+      ctx.beginPath(); ctx.arc(cx, cy, 6.5, 0, Math.PI*2); ctx.strokeStyle="#0a0f1c"; ctx.lineWidth=2; ctx.stroke();
+      ctx.beginPath(); ctx.arc(cx, cy, 5, 0, Math.PI*2); ctx.fillStyle=player.heldColors[i]; ctx.fill();
+      ctx.fillStyle="#0a0f1c";
+      const ex = cx + (player.facingRight?2:-2);
+      ctx.fillRect(ex-1, cy-1, 2, 2);
+    }
+    if (HERO.shape==="round") drawRoundHero(ctx, player.x+7, player.y+7, 7.5, stepCount);
+    else drawSlime(ctx, player.x+7, player.y+14, 9.5, HERO, t, player.facingRight, player.state);
+  }
+  ctx.restore();
+  if (state==="clear"){
+    ctx.fillStyle="rgba(6,10,20,0.55)"; ctx.fillRect(0,0,VIEW_W,VIEW_H);
+    ctx.fillStyle="#ffd23e"; ctx.font="24px 'HP Denki', sans-serif"; ctx.textAlign="center";
+    ctx.fillText("CLEAR!", VIEW_W/2, VIEW_H/2);
+    ctx.textAlign="left";
+  }
+  ctx.setTransform(1,0,0,1,0,0);
+}
+
+// ============ メインループ（30ステップ/秒の固定タイミング） ============
+let last=0, acc=0;
+function loop(ms){
+  requestAnimationFrame(loop);
+  if (!last) last=ms;
+  acc += Math.min(ms-last, 100); last=ms;
+  let stepped = false;
+  while (acc >= 1000/30){ step(); acc -= 1000/30; stepped = true; }
+  if (stepped) for (const k in pressed) delete pressed[k];  // 押した瞬間の入力は、ステップが消費したときだけ消す
+  draw();
+}
+requestAnimationFrame(loop);
+
+// 主役定義（Markdown）の読み込みと反映
+{
+  const ta = document.getElementById("hero");
+  const err = document.getElementById("heroErr");
+  document.getElementById("applyHero").onclick = ()=>{
+    const h = parseHero(ta.value);
+    if (h){ HERO = h; err.textContent=""; state="title"; }
+    else err.textContent="スライムメーカーのURLを読み取れませんでした。メーカーで発行されたURLを、そのまま貼ってください。";
+  };
+  const init = parseHero(ta.value); if (init) HERO = init;
+}
+
+// ルール定義（Markdown）の読み込みと反映
+{
+  const ta = document.getElementById("rules");
+  const err = document.getElementById("ruleErr");
+  const apply = ()=>{
+    const r = parseRules(ta.value);
+    if (r){ RULES = r; err.textContent=""; state="title"; }
+    else err.textContent="ルールを読み取れませんでした。「- 項目: 値」の形で書いてください。";
+  };
+  document.getElementById("applyRules").onclick = apply;
+  const init = parseRules(ta.value); if (init) RULES = init;
+}
+
+// 撮影・確認用: ?gen=1 で生成レベルを即プレイ、?stack=1 で足元に2個積んだ状態
+const _q = new URLSearchParams(location.search);
+if (_q.get("gen")){ genLevel(); startLevel(); }
+if (_q.get("stack")){ genLevel(); startLevel(); placeStack(); placeStack(); }
+if (_q.get("walk")){ genLevel(); startLevel(); keys["ArrowRight"]=true; for (let i=0;i<27;i++) step(); keys["ArrowRight"]=false; for (let i=0;i<30;i++) step(); }
+if (_q.get("blast")){ genLevel(); startLevel(); player.facingRight=false; placeSide(); detonate(); for (let i=0;i<90;i++) step(); }
+</script>
+</body>
+</html>
