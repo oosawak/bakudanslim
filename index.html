@@ -395,15 +395,11 @@ function placeSide(){
 }
 function placeStack(){
   const c = player.heldColors.shift();
-  // 足元の積み重なりを下へたどる（Pyxel版の規則: 新しい爆弾は一番下に入り、全部が1個分ずつ持ち上がる）
-  const stack=[]; let cx=player.x, cy=player.y;
-  while (true){
-    const f = bombs.find(o=>Math.abs(o.x-cx)<12 && Math.abs(o.y-(cy+14))<3);
-    if (!f) break; stack.push(f); cx=f.x; cy=f.y;
-  }
-  for (const o of stack) o.y -= 14;
+  // 新しい爆弾は親分の真下（積み重ねのいちばん上）に入る。既存の積み重ねは動かさない。
+  // 積む順に 親分・2・1 となり、起爆（置いた順）では下の1から爆発して、2で二段目が踏める
+  bombs.unshift(new Bomb(player.x, player.y, c));
   player.y -= 14;
-  bombs.unshift(new Bomb(cx, cy, c)); player.bombs--; shake=2;
+  player.bombs--; shake=2;
 }
 
 function step(){
