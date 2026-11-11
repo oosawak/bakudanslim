@@ -107,20 +107,32 @@ function parseHero(md){
   }
   return h;
 }
-// 丸い主役（OooMaker風）。cx, cy は中心、r は半径、t はステップ数
-function drawRoundHero(c, cx, cy, r, t){
+// 丸い主役（OooMaker風）。cx, cy は中心、r は半径、t はステップ数、eye は視線（-1〜1）
+function drawRoundHero(c, cx, cy, r, t, eye){
   c.fillStyle = "#101418";
   c.beginPath(); c.arc(cx, cy, r, 0, Math.PI*2); c.fill();
   c.fillStyle = HERO.color;
   c.beginPath(); c.arc(cx, cy, r*0.8, 0, Math.PI*2); c.fill();
   const blink = (t % 100) < 5;
-  const lo = Math.sin(t*0.05) > 0.3 ? r*0.12 : (Math.sin(t*0.021) > 0.4 ? -r*0.12 : 0);
+  const ex0 = (eye ? eye.dx : 0) * r, ey0 = (eye ? eye.dy : 0) * r;
   c.fillStyle = "#101418";
   for (const side of [-1,1]){
-    const ex = cx + side*r*0.34 + lo, ey = cy - r*0.08;
+    const ex = cx + side*r*0.34 + ex0, ey = cy - r*0.08 + ey0;
     if (blink){ c.fillRect(ex - r*0.13, ey, r*0.26, Math.max(1, r*0.07)); }
     else { c.beginPath(); c.arc(ex, ey, r*0.11, 0, Math.PI*2); c.fill(); }
   }
+}
+// 視線の規則（Pyxel版OooMakerの仕様）: 移動中は進行方向、停止中は正面でたまにキョロキョロ、
+// ときどき後ろ（しっぽ側）をじーっと見る。↑↓キーを押している間は目も上下する
+function heroEye(moving, vx, facingRight, t){
+  let dx = 0;
+  if (moving) dx = Math.sign(vx) * 0.36;
+  else if (t % 240 > 150) dx = (facingRight ? -1 : 1) * 0.36;
+  else { const cyc = Math.floor(t/30) % 4; dx = (cyc===1 ? 1 : (cyc===3 ? -1 : 0)) * 0.14; }
+  let dy = 0;
+  if (keys["ArrowUp"] || keys["KeyW"]) dy = -0.14;
+  else if (keys["ArrowDown"] || keys["KeyS"]) dy = 0.14;
+  return {dx, dy};
 }
 
 // ============ 入力 ============
@@ -446,7 +458,7 @@ function draw(){
   const t = stepCount/30;
   if (state==="title"){
     ctx.save(); ctx.translate(70, 130);
-    if (HERO.shape==="round") drawRoundHero(ctx, 0, -28, 30, stepCount);
+    if (HERO.shape==="round") drawRoundHero(ctx, 0, -28, 30, stepCount, heroEye(false, 0, true, stepCount));
     else drawSlime(ctx, 0, 0, 26, HERO, t, true, "NORMAL");
     ctx.restore();
     ctx.beginPath(); ctx.arc(112, 122, 7, 0, Math.PI*2); ctx.fillStyle="#f0473e"; ctx.fill();
@@ -492,7 +504,7 @@ function draw(){
       const ex = cx + (player.facingRight?2:-2);
       ctx.fillRect(ex-1, cy-1, 2, 2);
     }
-    if (HERO.shape==="round") drawRoundHero(ctx, player.x+7, player.y+7, 7.5, stepCount);
+    if (HERO.shape==="round") drawRoundHero(ctx, player.x+7, player.y+7, 7.5, stepCount, heroEye(Math.abs(player.vx)>0.3, player.vx, player.facingRight, stepCount));
     else drawSlime(ctx, player.x+7, player.y+14, 9.5, HERO, t, player.facingRight, player.state);
   }
   ctx.restore();
@@ -548,6 +560,7 @@ const _q = new URLSearchParams(location.search);
 if (_q.get("gen")){ genLevel(); startLevel(); }
 if (_q.get("stack")){ genLevel(); startLevel(); placeStack(); placeStack(); }
 if (_q.get("walk")){ genLevel(); startLevel(); keys["ArrowRight"]=true; for (let i=0;i<27;i++) step(); keys["ArrowRight"]=false; for (let i=0;i<30;i++) step(); }
+if (_q.get("run")){ genLevel(); startLevel(); keys["ArrowRight"]=true; for (let i=0;i<15;i++) step(); }
 if (_q.get("blast")){ genLevel(); startLevel(); player.facingRight=false; placeSide(); detonate(); for (let i=0;i<90;i++) step(); }
 </script>
 </body>
