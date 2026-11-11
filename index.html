@@ -259,7 +259,6 @@ class Player {
     this.heldColors=Array.from({length:RULES.maxBombs}, (_,i)=>PALETTE[i%PALETTE.length]);
     this.rq=[];
     this.history=Array.from({length:100}, ()=>[x,y]);
-    this.trail=[];   // 子分（引き連れた爆弾）の位置
   }
   update(solids){
     const L = btn("ArrowLeft","KeyA"), R = btn("ArrowRight","KeyD");
@@ -280,17 +279,6 @@ class Player {
       else this.state="NORMAL";
     } else if (this.state==="NORMAL") this.state="FALLING";
     this.history.unshift([this.x, this.y]); this.history.length=100;
-    // 子分: ロープでつながれたように追う（距離が開いた分だけ寄る。止まっても回り込まない）
-    while (this.trail.length < this.bombs){
-      const tp = this.trail.length===0 ? this : this.trail[this.trail.length-1];
-      this.trail.push({x: tp.x + (this.facingRight?-1:1)*RULES.gap, y: tp.y});
-    }
-    this.trail.length = this.bombs;
-    for (let i=0;i<this.trail.length;i++){
-      const tp = i===0 ? this : this.trail[i-1], f = this.trail[i];
-      const dx=f.x-tp.x, dy=f.y-tp.y, d=Math.hypot(dx,dy);
-      if (d > RULES.gap){ f.x = tp.x + dx/d*RULES.gap; f.y = tp.y + dy/d*RULES.gap; }
-    }
     const nrq=[];
     for (const [t,c] of this.rq){ if (t>0) nrq.push([t-1,c]); else { this.bombs++; this.heldColors.push(c); } }
     this.rq=nrq;
@@ -451,6 +439,19 @@ function step(){
   blastFx = blastFx.filter(f=>--f.t>0);
 }
 
+// 子分の位置: 親分の移動履歴を、道のりで dist px さかのぼった点
+function trailPoint(dist){
+  let acc = 0, px = player.x, py = player.y;
+  for (let k=1;k<player.history.length;k++){
+    const p = player.history[k];
+    acc += Math.hypot(p[0]-px, p[1]-py);
+    if (acc >= dist) return {x:p[0], y:p[1]};
+    px = p[0]; py = p[1];
+  }
+  const last = player.history[player.history.length-1];
+  return {x:last[0], y:last[1]};
+}
+
 // ============ 描画 ============
 function draw(){
   ctx.setTransform(2,0,0,2,0,0);
@@ -493,9 +494,10 @@ function draw(){
   for (const p of particles){ ctx.fillStyle=p.col; ctx.fillRect(p.x-1.5, p.y-1.5, 3, 3); }
   for (const b of bombs) b.draw(ctx, player);
   if (player){
-    // 子分（引き連れた爆弾）: 親分にロープでつながれて追う。下限は親分と同じ地面のラインまで下げ、上下の動きは上方向だけに出す
+    // 子分（引き連れた爆弾）: 親分の通った道を、距離ぶん遅れてたどる（Pyxel版の方式）。
+    // 下限は親分と同じ地面のラインまで下げ、上下の動きは上方向だけに出す
     for (let i=0;i<player.bombs;i++){
-      const f = player.trail[i] || player;
+      const f = trailPoint((i+1)*RULES.gap);
       const lift = (0.5 + 0.5*Math.sin(stepCount*0.2+i*1.8)) * 2.2;
       const cx = f.x+7, cy = f.y+7-lift;
       ctx.beginPath(); ctx.arc(cx, cy, 6.5, 0, Math.PI*2); ctx.strokeStyle="#0a0f1c"; ctx.lineWidth=2; ctx.stroke();
